@@ -16,13 +16,18 @@ final class AppState: ObservableObject {
     @Published var notes: [NoteItem] = [
         NoteItem(
             id: UUID(),
-            title: "Welcome to Yazboz",
-            content: "This is the initial skeleton. Next step is global shortcut + floating spotlight window.",
+            title: "Yazboz'a hoş geldin",
+            content: "Hızlı not panelini açmak için Cmd+Shift+K kullan.",
             createdAt: .now
+        ),
+        NoteItem(
+            id: UUID(),
+            title: "Örnek not",
+            content: "Bu uygulamayı sadeleştirilmiş bir akışla kullanıyoruz.",
+            createdAt: .now.addingTimeInterval(-3600)
         )
     ]
     @Published var selectedNoteID: UUID?
-    @Published var showQuickCapture = false
 
     var selectedNote: NoteItem? {
         guard let selectedNoteID else { return nil }
@@ -36,7 +41,7 @@ final class AppState: ObservableObject {
     }
 
     func addQuickNote(text: String) {
-        let title = text.split(separator: "\n").first.map(String.init) ?? "Quick Note"
+        let title = text.split(separator: "\n").first.map(String.init) ?? "Hızlı Not"
         let item = NoteItem(
             id: UUID(),
             title: title,
