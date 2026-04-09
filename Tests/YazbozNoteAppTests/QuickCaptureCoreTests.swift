@@ -5,24 +5,16 @@ import AppKit
 private struct StubScreenshotError: Error {}
 
 private final class StubBrowserLinkResolver: BrowserLinkResolver {
-    var directResult: String?
-    var addressBarResult: String?
+    var directResult: BrowserLinkResolutionResult
     private(set) var directCallCount = 0
-    private(set) var addressBarCallCount = 0
 
-    init(directResult: String? = nil, addressBarResult: String? = nil) {
+    init(directResult: BrowserLinkResolutionResult = .failure(.noActiveTab)) {
         self.directResult = directResult
-        self.addressBarResult = addressBarResult
     }
 
-    override func resolveDirectURL(from context: BrowserLinkContext) -> String? {
+    override func resolveDirectResult(from context: BrowserLinkContext) -> BrowserLinkResolutionResult {
         directCallCount += 1
         return directResult
-    }
-
-    override func captureURLViaAddressBar(from context: BrowserLinkContext) -> String? {
-        addressBarCallCount += 1
-        return addressBarResult
     }
 }
 
@@ -193,6 +185,14 @@ final class QuickCaptureCoreTests: XCTestCase {
         XCTAssertEqual(request.normalizedText, "not metni")
     }
 
+    func testSubmissionRequestParsesTextAndDoubleDashLink() {
+        let request = QuickCaptureSubmissionRequest(input: "  not metni --link ")
+
+        XCTAssertTrue(request.wantsLink)
+        XCTAssertFalse(request.wantsScreenshot)
+        XCTAssertEqual(request.normalizedText, "not metni")
+    }
+
     func testSubmissionRequestParsesTextScreenshotAndLink() {
         let request = QuickCaptureSubmissionRequest(input: " metin \"\" -link ")
 
@@ -203,38 +203,34 @@ final class QuickCaptureCoreTests: XCTestCase {
 
     func testBrowserLinkResolverUsesDirectSafariURLWithoutFallback() {
         let resolver = StubBrowserLinkResolver(
-            directResult: "https://example.com/safari",
-            addressBarResult: "https://example.com/fallback"
+            directResult: .success("https://example.com/safari")
         )
         let context = BrowserLinkContext(bundleID: "com.apple.Safari", processID: 1, icon: nil)
 
         XCTAssertEqual(resolver.resolve(context: context), "https://example.com/safari")
         XCTAssertEqual(resolver.directCallCount, 1)
-        XCTAssertEqual(resolver.addressBarCallCount, 0)
     }
 
-    func testBrowserLinkResolverFallsBackToAddressBarWhenDirectFails() {
+    func testBrowserLinkResolverReturnsAutomationDeniedWhenDirectAppleEventFails() {
         let resolver = StubBrowserLinkResolver(
-            directResult: nil,
-            addressBarResult: "https://example.com/fallback"
+            directResult: .failure(.automationDenied)
         )
         let context = BrowserLinkContext(bundleID: "com.brave.Browser", processID: 1, icon: nil)
 
-        XCTAssertEqual(resolver.resolve(context: context), "https://example.com/fallback")
-        XCTAssertEqual(resolver.directCallCount, 1)
-        XCTAssertEqual(resolver.addressBarCallCount, 1)
+        XCTAssertEqual(resolver.resolveResult(context: context), .failure(.automationDenied))
+        XCTAssertNil(resolver.resolve(context: context))
+        XCTAssertEqual(resolver.directCallCount, 2)
     }
 
-    func testBrowserLinkResolverReturnsNilWhenAllStrategiesFail() {
+    func testBrowserLinkResolverReturnsNilWhenDirectURLIsInvalid() {
         let resolver = StubBrowserLinkResolver(
-            directResult: "about:blank",
-            addressBarResult: "notaurl"
+            directResult: .failure(.invalidURL)
         )
         let context = BrowserLinkContext(bundleID: "com.microsoft.edgemac", processID: 1, icon: nil)
 
         XCTAssertNil(resolver.resolve(context: context))
-        XCTAssertEqual(resolver.directCallCount, 1)
-        XCTAssertEqual(resolver.addressBarCallCount, 1)
+        XCTAssertEqual(resolver.resolveResult(context: context), .failure(.invalidURL))
+        XCTAssertEqual(resolver.directCallCount, 2)
     }
 
     func testWidthAdjustedFramePreservesCenterAndHeight() {
@@ -547,7 +543,7 @@ final class QuickCaptureIntegrationTests: XCTestCase {
         let (appState, baseURL) = makeEmptyAppState()
         defer { removeTemporaryBaseURL(baseURL) }
 
-        let resolver = StubBrowserLinkResolver(directResult: "https://example.com")
+        let resolver = StubBrowserLinkResolver(directResult: .success("https://example.com"))
         let toastSpy = ToastSpy()
         let controller = QuickCaptureWindowController(
             appState: appState,
@@ -590,6 +586,31 @@ final class QuickCaptureIntegrationTests: XCTestCase {
         XCTAssertEqual(controller.visibilityState, .visible)
         XCTAssertEqual(controller.debugInputText, "Link denemesi -link")
         XCTAssertEqual(toastSpy.messages, ["Aktif sekme linki alinamadi"])
+    }
+
+    func testLinkSubmitShowsAutomationDeniedMessageWhenBrowserAutomationFails() {
+        _ = NSApplication.shared
+        let (appState, baseURL) = makeEmptyAppState()
+        defer { removeTemporaryBaseURL(baseURL) }
+
+        let resolver = StubBrowserLinkResolver(directResult: .failure(.automationDenied))
+        let toastSpy = ToastSpy()
+        let controller = QuickCaptureWindowController(
+            appState: appState,
+            linkResolver: resolver,
+            toastPresenter: toastSpy
+        )
+
+        controller.show(animated: false)
+        controller.debugSetBrowserContextForTests(
+            BrowserLinkContext(bundleID: "com.google.Chrome", processID: 1, icon: nil)
+        )
+        controller.debugSubmitForTests("Link denemesi -link")
+
+        XCTAssertEqual(appState.notes.count, 0)
+        XCTAssertEqual(controller.visibilityState, .visible)
+        XCTAssertEqual(controller.debugInputText, "Link denemesi -link")
+        XCTAssertEqual(toastSpy.messages, ["Tarayici kontrol izni verilmedi"])
     }
 
     func testScreenshotSubmitAddsPersistentImageNoteWhenCaptureSucceeds() {
@@ -703,7 +724,7 @@ final class QuickCaptureIntegrationTests: XCTestCase {
         let (appState, baseURL) = makeEmptyAppState()
         defer { removeTemporaryBaseURL(baseURL) }
 
-        let resolver = StubBrowserLinkResolver(directResult: "https://example.com/path")
+        let resolver = StubBrowserLinkResolver(directResult: .success("https://example.com/path"))
         let screenshotService = StubScreenshotService(
             result: .success(QuickCaptureScreenshotCapture(pngData: makeSampleScreenshotPNGData()))
         )

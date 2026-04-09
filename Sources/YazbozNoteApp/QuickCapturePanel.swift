@@ -227,10 +227,14 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
     private let inputView: QuickCaptureInputView
     private let inputCoordinator: QuickCaptureInputCoordinator
     private var stateMachine = QuickCapturePanelStateMachine()
+    private var lastObservedExternalApplication: NSRunningApplication?
+    private var browserContextOverrideForTests: BrowserLinkContext?
     private var browserContextForSession: BrowserLinkContext?
     private var foregroundProcessIDForSession: pid_t?
     private var cachedBrowserURLForSession: String?
+    private var lastBrowserLinkFailure: BrowserLinkResolutionFailure?
     private let screenshotCaptureDelay: TimeInterval
+    nonisolated(unsafe) private var workspaceActivationObserver: NSObjectProtocol?
 
     init(
         appState: AppState,
@@ -286,6 +290,7 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         }
 
         panel.contentView = inputView
+        registerWorkspaceObserver()
     }
 
     var visibilityState: QuickCaptureVisibilityState {
@@ -297,8 +302,10 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
     var debugInputText: String { inputView.textField.stringValue }
 
     func debugSetBrowserContextForTests(_ context: BrowserLinkContext?) {
+        browserContextOverrideForTests = context
         browserContextForSession = context
         cachedBrowserURLForSession = nil
+        lastBrowserLinkFailure = nil
         inputView.setLinkBrowserIcon(context?.icon)
     }
 
@@ -326,16 +333,12 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
             return
         }
         if refreshSessionContext {
-            foregroundProcessIDForSession = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            browserContextForSession = activeSupportedBrowserContext()
-            cachedBrowserURLForSession = browserContextForSession.flatMap { linkResolver.resolveDirectURL(from: $0) }
-            inputView.setLinkBrowserIcon(browserContextForSession?.icon)
+            self.refreshSessionContext()
         }
-        inputView.setLinkBrowserIconVisible(false)
 
         let frame = screen.visibleFrame
         let width: CGFloat = 700
-        let height: CGFloat = 62
+        let height = inputView.preferredHeight
         let x = frame.midX - (width / 2)
         let y = frame.maxY - height - 150
         let targetFrame = NSRect(x: x, y: y, width: width, height: height)
@@ -429,9 +432,21 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         let request = QuickCaptureSubmissionRequest(input: text)
         guard request.shouldSubmit else { return }
 
-        let linkURLString = request.wantsLink ? activeBrowserURLString() : nil
-        if request.wantsLink && linkURLString == nil {
-            showLinkResolutionFailure()
+        if request.wantsLink {
+            refreshSessionContext()
+        }
+
+        let linkResolution = request.wantsLink ? activeBrowserURLResolution() : .failure(.noBrowserContext)
+        let linkURLString: String?
+        switch linkResolution {
+        case .success(let value):
+            linkURLString = value
+        case .failure:
+            linkURLString = nil
+        }
+
+        if request.wantsLink, case .failure(let failure) = linkResolution {
+            showLinkResolutionFailure(failure)
             return
         }
 
@@ -464,10 +479,29 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
     }
 
     private func updateLinkIndicator(for text: String) {
-        let wantsLink = text.contains("-link")
+        let request = QuickCaptureSubmissionRequest(input: text)
+        let wantsLink = request.wantsLink
         inputView.setLinkBrowserIconVisible(wantsLink && browserContextForSession?.icon != nil)
-        if wantsLink && cachedBrowserURLForSession == nil {
-            cachedBrowserURLForSession = browserContextForSession.flatMap { linkResolver.resolveDirectURL(from: $0) }
+        if wantsLink {
+            if cachedBrowserURLForSession == nil, lastBrowserLinkFailure == nil {
+                switch activeBrowserURLResolution() {
+                case .success(let value):
+                    cachedBrowserURLForSession = value
+                case .failure(let failure):
+                    lastBrowserLinkFailure = failure
+                }
+            }
+            if let cachedBrowserURLForSession {
+                inputView.setLinkPreview(cachedBrowserURLForSession)
+            } else {
+                inputView.setLinkPreview(nil)
+            }
+        } else {
+            inputView.setLinkPreview(nil)
+        }
+
+        if panel.isVisible || stateMachine.state == .visible {
+            updatePanelHeight(animated: true)
         }
     }
 
@@ -529,17 +563,29 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func activeBrowserURLString() -> String? {
+    private func activeBrowserURLResolution() -> BrowserLinkResolutionResult {
         if let cachedBrowserURLForSession, linkResolver.isValidURL(cachedBrowserURLForSession) {
-            return cachedBrowserURLForSession
+            return .success(cachedBrowserURLForSession)
         }
-        let resolved = linkResolver.resolve(context: browserContextForSession)
-        cachedBrowserURLForSession = resolved
-        return resolved
+
+        if let lastBrowserLinkFailure {
+            return .failure(lastBrowserLinkFailure)
+        }
+
+        let result = linkResolver.resolveResult(context: browserContextForSession)
+        switch result {
+        case .success(let value):
+            cachedBrowserURLForSession = value
+            lastBrowserLinkFailure = nil
+        case .failure(let failure):
+            cachedBrowserURLForSession = nil
+            lastBrowserLinkFailure = failure
+        }
+        return result
     }
 
-    private func showLinkResolutionFailure() {
-        toastPresenter.show(message: "Aktif sekme linki alinamadi", anchoredTo: panel)
+    private func showLinkResolutionFailure(_ failure: BrowserLinkResolutionFailure) {
+        toastPresenter.show(message: linkResolutionMessage(for: failure), anchoredTo: panel)
         inputCoordinator.focusWithRetry()
     }
 
@@ -555,13 +601,129 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         inputCoordinator.focusWithRetry()
     }
 
-    private func activeSupportedBrowserContext() -> BrowserLinkContext? {
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              let bundleID = app.bundleIdentifier,
+    private func registerWorkspaceObserver() {
+        if let frontmostApplication = NSWorkspace.shared.frontmostApplication,
+           !isSelfApplication(frontmostApplication) {
+            lastObservedExternalApplication = frontmostApplication
+        }
+
+        workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            MainActor.assumeIsolated { [weak self] in
+                guard let self else { return }
+                self.handleActivatedApplication(app)
+            }
+        }
+    }
+
+    private func handleActivatedApplication(_ app: NSRunningApplication?) {
+        guard let app, !isSelfApplication(app) else { return }
+        lastObservedExternalApplication = app
+
+        if stateMachine.state == .visible || stateMachine.state == .showing {
+            refreshSessionContext(using: app)
+        }
+    }
+
+    private func refreshSessionContext() {
+        refreshSessionContext(using: currentExternalApplication())
+    }
+
+    private func refreshSessionContext(using application: NSRunningApplication?) {
+        if let browserContextOverrideForTests {
+            foregroundProcessIDForSession = browserContextOverrideForTests.processID
+            browserContextForSession = browserContextOverrideForTests
+            cachedBrowserURLForSession = nil
+            lastBrowserLinkFailure = nil
+            inputView.setLinkBrowserIcon(browserContextOverrideForTests.icon)
+            updateLinkIndicator(for: inputView.textField.stringValue)
+            return
+        }
+
+        foregroundProcessIDForSession = application?.processIdentifier
+        browserContextForSession = supportedBrowserContext(for: application)
+        cachedBrowserURLForSession = nil
+        lastBrowserLinkFailure = nil
+        inputView.setLinkBrowserIcon(browserContextForSession?.icon)
+        updateLinkIndicator(for: inputView.textField.stringValue)
+    }
+
+    private func currentExternalApplication() -> NSRunningApplication? {
+        if let frontmostApplication = NSWorkspace.shared.frontmostApplication,
+           !isSelfApplication(frontmostApplication) {
+            return frontmostApplication
+        }
+
+        return lastObservedExternalApplication
+    }
+
+    private func supportedBrowserContext(for application: NSRunningApplication?) -> BrowserLinkContext? {
+        guard let application,
+              let bundleID = application.bundleIdentifier,
               BrowserLinkResolver.isSupportedBrowser(bundleID: bundleID) else {
             return nil
         }
-        return BrowserLinkContext(bundleID: bundleID, processID: app.processIdentifier, icon: app.icon)
+
+        return BrowserLinkContext(
+            bundleID: bundleID,
+            processID: application.processIdentifier,
+            icon: application.icon
+        )
+    }
+
+    private func isSelfApplication(_ application: NSRunningApplication) -> Bool {
+        if application.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            return true
+        }
+
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
+            return false
+        }
+
+        return application.bundleIdentifier == bundleIdentifier
+    }
+
+    private func linkResolutionMessage(for failure: BrowserLinkResolutionFailure) -> String {
+        switch failure {
+        case .automationDenied:
+            return "Tarayici kontrol izni verilmedi"
+        case .unsupportedBrowser, .noBrowserContext:
+            return "Aktif tarayici desteklenmiyor"
+        case .noActiveTab, .invalidURL, .scriptError:
+            return "Aktif sekme linki alinamadi"
+        }
+    }
+
+    private func updatePanelHeight(animated: Bool) {
+        let desiredHeight = inputView.preferredHeight
+        guard abs(panel.frame.height - desiredHeight) > 0.5 else { return }
+
+        let updatedFrame = NSRect(
+            x: panel.frame.origin.x,
+            y: panel.frame.maxY - desiredHeight,
+            width: panel.frame.width,
+            height: desiredHeight
+        )
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.20, 0.80, 0.20, 1.00)
+                panel.animator().setFrame(updatedFrame, display: true)
+            }
+        } else {
+            panel.setFrame(updatedFrame, display: true)
+        }
+    }
+
+    deinit {
+        if let workspaceActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
+        }
     }
 }
 
@@ -665,12 +827,20 @@ private final class QuickCaptureTextField: NSTextField {
 
 @MainActor
 private final class QuickCaptureInputView: NSView, NSTextFieldDelegate {
+    private enum Layout {
+        static let baseHeight: CGFloat = 62
+        static let expandedHeight: CGFloat = 92
+        static let rowCenterY: CGFloat = 31
+    }
+
     let textField = QuickCaptureTextField(frame: .zero)
 
     private let iconView = NSImageView(frame: .zero)
     private let placeholderLabel = NSTextField(labelWithString: "Aklından ne geçiyor?")
     private let shortcutHintLabel = NSTextField(labelWithString: "⌘ ç")
     private let linkBrowserIconView = NSImageView(frame: .zero)
+    private let linkPreviewLabel = NSTextField(labelWithString: "")
+    private var linkPreviewHeightConstraint: NSLayoutConstraint?
 
     var onSubmit: ((String) -> Void)?
     var onTextChanged: ((String) -> Void)?
@@ -695,6 +865,10 @@ private final class QuickCaptureInputView: NSView, NSTextFieldDelegate {
 
     override var acceptsFirstResponder: Bool { true }
 
+    var preferredHeight: CGFloat {
+        linkPreviewLabel.isHidden ? Layout.baseHeight : Layout.expandedHeight
+    }
+
     func clearInput() {
         setInputText("")
     }
@@ -717,6 +891,19 @@ private final class QuickCaptureInputView: NSView, NSTextFieldDelegate {
 
     func setLinkBrowserIconVisible(_ visible: Bool) {
         linkBrowserIconView.isHidden = !visible || linkBrowserIconView.image == nil
+    }
+
+    func setLinkPreview(_ value: String?) {
+        let normalizedValue = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedValue, !normalizedValue.isEmpty {
+            linkPreviewLabel.stringValue = normalizedValue
+            linkPreviewLabel.isHidden = false
+            linkPreviewHeightConstraint?.constant = 16
+        } else {
+            linkPreviewLabel.stringValue = ""
+            linkPreviewLabel.isHidden = true
+            linkPreviewHeightConstraint?.constant = 0
+        }
     }
 
     func playCaptureFeedbackAnimation(completion: @escaping @MainActor @Sendable () -> Void) {
@@ -824,6 +1011,13 @@ private final class QuickCaptureInputView: NSView, NSTextFieldDelegate {
         linkBrowserIconView.isHidden = true
         addSubview(linkBrowserIconView)
 
+        linkPreviewLabel.translatesAutoresizingMaskIntoConstraints = false
+        linkPreviewLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        linkPreviewLabel.textColor = NSColor.white.withAlphaComponent(0.42)
+        linkPreviewLabel.lineBreakMode = .byTruncatingMiddle
+        linkPreviewLabel.isHidden = true
+        addSubview(linkPreviewLabel)
+
         textField.translatesAutoresizingMaskIntoConstraints = false
         textField.isBordered = false
         textField.isBezeled = false
@@ -838,28 +1032,35 @@ private final class QuickCaptureInputView: NSView, NSTextFieldDelegate {
         textField.action = #selector(submitAction)
         addSubview(textField)
 
+        linkPreviewHeightConstraint = linkPreviewLabel.heightAnchor.constraint(equalToConstant: 0)
+        linkPreviewHeightConstraint?.isActive = true
+
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.centerYAnchor.constraint(equalTo: topAnchor, constant: Layout.rowCenterY),
             iconView.widthAnchor.constraint(equalToConstant: 25),
             iconView.heightAnchor.constraint(equalToConstant: 25),
 
             textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 62),
             textField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
-            textField.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 1),
+            textField.centerYAnchor.constraint(equalTo: topAnchor, constant: Layout.rowCenterY + 1),
             textField.heightAnchor.constraint(equalToConstant: 32),
 
             placeholderLabel.leadingAnchor.constraint(equalTo: textField.leadingAnchor),
-            placeholderLabel.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 1),
+            placeholderLabel.centerYAnchor.constraint(equalTo: topAnchor, constant: Layout.rowCenterY + 1),
             placeholderLabel.trailingAnchor.constraint(lessThanOrEqualTo: shortcutHintLabel.leadingAnchor, constant: -12),
 
             shortcutHintLabel.trailingAnchor.constraint(equalTo: linkBrowserIconView.leadingAnchor, constant: -8),
-            shortcutHintLabel.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 1),
+            shortcutHintLabel.centerYAnchor.constraint(equalTo: topAnchor, constant: Layout.rowCenterY + 1),
 
             linkBrowserIconView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            linkBrowserIconView.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 1),
+            linkBrowserIconView.centerYAnchor.constraint(equalTo: topAnchor, constant: Layout.rowCenterY + 1),
             linkBrowserIconView.widthAnchor.constraint(equalToConstant: 14),
-            linkBrowserIconView.heightAnchor.constraint(equalToConstant: 14)
+            linkBrowserIconView.heightAnchor.constraint(equalToConstant: 14),
+
+            linkPreviewLabel.leadingAnchor.constraint(equalTo: textField.leadingAnchor),
+            linkPreviewLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
+            linkPreviewLabel.topAnchor.constraint(equalTo: textField.bottomAnchor, constant: 8)
         ])
     }
 

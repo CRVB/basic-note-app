@@ -9,6 +9,7 @@ struct BlockEditorView: View {
 
     @State private var slashMenuBlockID: UUID?
     @State private var focusedBlockID: UUID?
+    @State private var focusRequestID = UUID()
 
     var body: some View {
         GeometryReader { proxy in
@@ -35,22 +36,23 @@ struct BlockEditorView: View {
                                 TextBlockRow(
                                     block: $block,
                                     isFocused: focusedBlockID == block.id,
+                                    focusRequestID: focusedBlockID == block.id ? focusRequestID : nil,
                                     onFocus: {
                                         focusedBlockID = block.id
                                     },
                                     onEnter: {
                                         slashMenuBlockID = nil
-                                        focusedBlockID = NoteBlockEditing.insertParagraph(
+                                        requestFocus(NoteBlockEditing.insertParagraph(
                                             after: block.id,
                                             in: &blocks
-                                        )
+                                        ))
                                     },
                                     onBackspaceWhenEmpty: {
                                         slashMenuBlockID = nil
-                                        focusedBlockID = NoteBlockEditing.removeTextBlock(
+                                        requestFocus(NoteBlockEditing.removeTextBlock(
                                             id: block.id,
                                             in: &blocks
-                                        )
+                                        ))
                                     },
                                     onSlashRequest: {
                                         slashMenuBlockID = block.id
@@ -82,13 +84,13 @@ struct BlockEditorView: View {
         }
         .onAppear {
             if focusedBlockID == nil {
-                focusedBlockID = blocks.first(where: { $0.isTextual })?.id
+                requestFocus(blocks.first(where: { $0.isTextual })?.id)
             }
         }
         .onChange(of: blocks) { _, updatedBlocks in
             blocks = NoteBlockEditing.normalizedBlocks(updatedBlocks)
             if focusedBlockID == nil {
-                focusedBlockID = blocks.first(where: { $0.isTextual })?.id
+                requestFocus(blocks.first(where: { $0.isTextual })?.id)
             }
         }
     }
@@ -108,13 +110,13 @@ struct BlockEditorView: View {
         switch selectedKind {
         case .paragraph, .heading1, .heading2, .heading3:
             NoteBlockEditing.replaceTextBlockKind(id: blockID, with: selectedKind, in: &blocks)
-            focusedBlockID = blockID
+            requestFocus(blockID)
         case .image:
             guard let asset = onImportImageFromDisk() else {
                 if let index = blocks.firstIndex(where: { $0.id == blockID }) {
                     blocks[index].text = ""
                 }
-                focusedBlockID = blockID
+                requestFocus(blockID)
                 return
             }
 
@@ -123,13 +125,19 @@ struct BlockEditorView: View {
             }
 
             let preferredWidth = min(Double(contentWidth), asset.pixelWidth)
-            focusedBlockID = NoteBlockEditing.replaceWithImageBlock(
+            requestFocus(NoteBlockEditing.replaceWithImageBlock(
                 id: blockID,
                 assetID: asset.id,
                 preferredWidth: preferredWidth,
                 in: &blocks
-            )
+            ))
         }
+    }
+
+    private func requestFocus(_ blockID: UUID?) {
+        focusedBlockID = blockID
+        guard blockID != nil else { return }
+        focusRequestID = UUID()
     }
 }
 
@@ -195,6 +203,7 @@ private struct SlashMenuButton: View {
 private struct TextBlockRow: View {
     @Binding var block: NoteBlock
     let isFocused: Bool
+    let focusRequestID: UUID?
     let onFocus: () -> Void
     let onEnter: () -> Void
     let onBackspaceWhenEmpty: () -> Void
@@ -207,6 +216,7 @@ private struct TextBlockRow: View {
             text: $block.text,
             kind: block.kind,
             isFocused: isFocused,
+            focusRequestID: focusRequestID,
             measuredHeight: $measuredHeight,
             onFocus: onFocus,
             onEnter: onEnter,
@@ -305,6 +315,7 @@ private struct BlockTextEditorRepresentable: NSViewRepresentable {
     @Binding var text: String
     let kind: NoteBlockKind
     let isFocused: Bool
+    let focusRequestID: UUID?
     @Binding var measuredHeight: CGFloat
     let onFocus: () -> Void
     let onEnter: () -> Void
@@ -358,7 +369,11 @@ private struct BlockTextEditorRepresentable: NSViewRepresentable {
         context.coordinator.applyStyle(kind, to: textView)
         context.coordinator.updateMeasuredHeight(for: textView)
 
-        if isFocused, textView.window?.firstResponder != textView {
+        if isFocused,
+           let focusRequestID,
+           focusRequestID != context.coordinator.lastAppliedFocusRequestID,
+           textView.window?.firstResponder != textView {
+            context.coordinator.lastAppliedFocusRequestID = focusRequestID
             DispatchQueue.main.async {
                 textView.window?.makeFirstResponder(textView)
             }
@@ -369,6 +384,7 @@ private struct BlockTextEditorRepresentable: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: BlockTextEditorRepresentable
         weak var textView: BlockNSTextView?
+        var lastAppliedFocusRequestID: UUID?
 
         init(_ parent: BlockTextEditorRepresentable) {
             self.parent = parent

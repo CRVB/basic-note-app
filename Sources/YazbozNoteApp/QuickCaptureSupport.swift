@@ -4,6 +4,8 @@ import QuartzCore
 /// Kullanıcının hızlı yakalama paneline girdiği metni ayrıştıran yapı
 /// Ekran görüntüsü, link ve metin içerip içermediğini belirler
 struct QuickCaptureSubmissionRequest: Equatable {
+    private static let linkFlags = ["--link", "-link"]
+
     let wantsScreenshot: Bool  // "" (boş tırnak) içerirse ekran görüntüsü ister
     let wantsLink: Bool        // "-link" bayrağı içerirse tarayıcı linkini ister
     let normalizedText: String? // Temizlenmiş metin içeriği
@@ -13,12 +15,13 @@ struct QuickCaptureSubmissionRequest: Equatable {
         // Kullanıcı "" yazarsa ekran görüntüsü almak istiyordur
         wantsScreenshot = input.contains("\"\"")
         // Kullanıcı "-link" yazarsa tarayıcıdaki linki almak istiyordur
-        wantsLink = input.contains("-link")
+        wantsLink = Self.linkFlags.contains { input.contains($0) }
 
         // Bayrağı temizle ve normalleştir
-        let cleaned = input
-            .replacingOccurrences(of: "\"\"", with: "")
-            .replacingOccurrences(of: "-link", with: "")
+        var cleaned = input.replacingOccurrences(of: "\"\"", with: "")
+        for flag in Self.linkFlags {
+            cleaned = cleaned.replacingOccurrences(of: flag, with: "")
+        }
         normalizedText = QuickCaptureInputCoordinator.normalizeSubmission(cleaned)
     }
 
@@ -36,107 +39,74 @@ struct BrowserLinkContext {
     let icon: NSImage?      // Tarayıcı uygulaması ikonu
 }
 
+enum BrowserLinkResolutionFailure: Equatable {
+    case noBrowserContext
+    case unsupportedBrowser
+    case automationDenied
+    case noActiveTab
+    case invalidURL
+    case scriptError(code: Int?)
+}
+
+enum BrowserLinkResolutionResult: Equatable {
+    case success(String)
+    case failure(BrowserLinkResolutionFailure)
+}
+
 /// Açık tarayıcı penceresinden mevcut URL'i alan ana sınıf
-/// İki farklı yöntemle linki almaya çalışır: doğrudan AppleScript veya adres çubuğundan
+/// Linki sadece tarayıcıya doğrudan Apple Events / AppleScript sorusu ile almaya çalışır
 class BrowserLinkResolver {
-    /// Clipboard'ın anlık görüntüsünü tutar (eski haline dönüş için)
-    private struct PasteboardSnapshot {
-        let items: [[NSPasteboard.PasteboardType: Data]]
+    struct AppleScriptExecutionError: Error, Equatable {
+        let code: Int?
+        let message: String?
     }
 
-    /// Ana metod: Tarayıcıdan URL'i almaya çalışır
-    /// Parametreler: BrowserLinkContext - Aktif tarayıcı bilgileri
-    /// Dönüş: Başarılı olursa URL string'i, başarısız olursa nil
     func resolve(context: BrowserLinkContext?) -> String? {
-        guard let context else { return nil }
-
-        // 1. Adım: Direkt olarak tarayıcıdan URL'i almayı dene (hızlı ve güvenilir)
-        if let direct = resolveDirectURL(from: context), isValidURL(direct) {
-            return direct
-        }
-
-        // 2. Adım: Başarısız olursa, adres çubuğundan kopyalayarak almayı dene
-        if let addressBar = captureURLViaAddressBar(from: context), isValidURL(addressBar) {
-            return addressBar
-        }
-
-        // 3. Adım: Her iki yöntem de başarısız olursa nil döndür
-        return nil
-    }
-
-    /// Yöntem 1: AppleScript kullanarak tarayıcıdan doğrudan URL çekme
-    /// Bu yöntem daha güvenli ve clipboard'ı etkilemez
-    func resolveDirectURL(from context: BrowserLinkContext) -> String? {
-        // Tarayıcıya göre uygun AppleScript'i al
-        guard let script = Self.directBrowserURLScript(for: context.bundleID),
-              let value = executeAppleScript(script),  // AppleScript çalıştır
-              isValidURL(value) else {                 // Geçerli bir URL mı kontrol et
+        switch resolveResult(context: context) {
+        case .success(let value):
+            return value
+        case .failure:
             return nil
         }
-
-        return value
     }
 
-    /// Yöntem 2: Tarayıcıyı aktif yap, Cmd+L (adres çubuğu seç) ve Cmd+C (kopyala) yap
-    /// Ardından clipboard'dan URL'i oku
-    func captureURLViaAddressBar(from context: BrowserLinkContext) -> String? {
-        let pasteboard = NSPasteboard.general
-        // Eski clipboard içeriğini kaydet (restore etmek için)
-        let snapshot = snapshotPasteboard()
-        let originalString = pasteboard.string(forType: .string)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let currentApp = NSRunningApplication.current
+    func resolveResult(context: BrowserLinkContext?) -> BrowserLinkResolutionResult {
+        guard let context else {
+            return .failure(.noBrowserContext)
+        }
+        return resolveDirectResult(from: context)
+    }
 
-        // Metod atıldığında, clipboard'ı geri yükle ve orijinal app'e dön
-        defer {
-            restorePasteboard(snapshot)
-            _ = currentApp.activate(options: [.activateAllWindows])
+    func resolveDirectURL(from context: BrowserLinkContext) -> String? {
+        switch resolveDirectResult(from: context) {
+        case .success(let value):
+            return value
+        case .failure:
+            return nil
+        }
+    }
+
+    func resolveDirectResult(from context: BrowserLinkContext) -> BrowserLinkResolutionResult {
+        guard let script = Self.directBrowserURLScript(for: context.bundleID) else {
+            return .failure(.unsupportedBrowser)
         }
 
-        // Hedef tarayıcıyı aktive et
-        guard let app = NSRunningApplication(processIdentifier: context.processID) else { return nil }
-        _ = app.activate(options: [.activateAllWindows])
-        Thread.sleep(forTimeInterval: 0.14)  // Tarayıcının aktive olması için bekle
-
-        let changeCount = pasteboard.changeCount
-        // AppleScript: Cmd+L ile adres çubuğunu seç, ardından Cmd+C ile kopyala
-        let script = """
-        tell application "System Events"
-            keystroke "l" using command down
-            delay 0.08
-            keystroke "c" using command down
-        end tell
-        """
-        _ = executeAppleScript(script)
-
-        // 700ms içinde clipboard'dan URL'i oku
-        let timeout = CFAbsoluteTimeGetCurrent() + 0.7
-        var didChangeClipboard = false
-        while CFAbsoluteTimeGetCurrent() < timeout {
-            // Clipboard'ın değişip değişmediğini kontrol et
-            if pasteboard.changeCount != changeCount {
-                didChangeClipboard = true
+        switch executeAppleScript(script) {
+        case .success(let value):
+            let normalizedValue = value.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            guard !normalizedValue.isEmpty else {
+                return .failure(.noActiveTab)
             }
-
-            if let candidate = pasteboard.string(forType: .string)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               isValidURL(candidate),  // Geçerli bir URL mı?
-               didChangeClipboard || candidate != originalString {  // Yeni içerik mi?
-                return candidate
+            guard isValidURL(normalizedValue) else {
+                return .failure(.invalidURL)
             }
-
-            Thread.sleep(forTimeInterval: 0.04)  // 40ms bekle ve tekrar kontrol et
+            return .success(normalizedValue)
+        case .failure(let error):
+            if error.code == -1743 {
+                return .failure(.automationDenied)
+            }
+            return .failure(.scriptError(code: error.code))
         }
-
-        // Timeout sonrası final kontrol (redundant kontrol)
-        if let candidate = pasteboard.string(forType: .string)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           isValidURL(candidate),
-           didChangeClipboard || candidate != originalString {
-            return candidate
-        }
-
-        return nil
     }
 
     /// URL'nin geçerli olup olmadığını kontrol eder
@@ -195,50 +165,20 @@ class BrowserLinkResolver {
         """
     }
 
-    /// Clipboard'ın mevcut içeriğinin tam bir kopyasını oluştur
-    /// Daha sonra restore etmek için kullanılır
-    private func snapshotPasteboard() -> PasteboardSnapshot {
-        let pasteboard = NSPasteboard.general
-        // Tüm clipboard öğelerini ve formatlarını kaydet
-        let serialized: [[NSPasteboard.PasteboardType: Data]] = pasteboard.pasteboardItems?.map { item in
-            var mapped: [NSPasteboard.PasteboardType: Data] = [:]
-            for type in item.types {
-                if let data = item.data(forType: type) {
-                    mapped[type] = data
-                }
-            }
-            return mapped
-        } ?? []
-
-        return PasteboardSnapshot(items: serialized)
-    }
-
-    /// Clipboard'ı önceki haline geri yükle
-    /// Kullanıcının orijinal clipboard içeriği korunur
-    private func restorePasteboard(_ snapshot: PasteboardSnapshot) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-
-        // Kaydedilen tüm öğeleri geri yükle
-        for itemMap in snapshot.items {
-            let item = NSPasteboardItem()
-            for (type, data) in itemMap {
-                item.setData(data, forType: type)
-            }
-            pasteboard.writeObjects([item])
+    private func executeAppleScript(_ script: String) -> Result<String, AppleScriptExecutionError> {
+        guard let appleScript = NSAppleScript(source: script) else {
+            return .failure(AppleScriptExecutionError(code: nil, message: nil))
         }
-    }
-
-    /// AppleScript'i çalıştır ve sonucu string olarak döndür
-    private func executeAppleScript(_ script: String) -> String? {
-        guard let appleScript = NSAppleScript(source: script) else { return nil }
 
         var errorInfo: NSDictionary?
         let output = appleScript.executeAndReturnError(&errorInfo)
-        if errorInfo != nil { return nil }  // Hata varsa nil döndür
+        if let errorInfo {
+            let code = errorInfo[NSAppleScript.errorNumber] as? Int
+            let message = errorInfo[NSAppleScript.errorMessage] as? String
+            return .failure(AppleScriptExecutionError(code: code, message: message))
+        }
 
-        let value = output.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return value.isEmpty ? nil : value
+        return .success(output.stringValue ?? "")
     }
 }
 
