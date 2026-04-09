@@ -1,14 +1,13 @@
 import AppKit
 import Carbon
 import QuartzCore
-import ImageIO
-import UniformTypeIdentifiers
 
 /// Uygulama içi panel tetiklemeleri için merkezi bildirim adı.
 extension Notification.Name {
     static let toggleQuickCapturePanel = Notification.Name("toggleQuickCapturePanel")
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var quickCaptureController: QuickCaptureWindowController?
     private var hotkeyService: QuickCaptureHotkeyService?
@@ -16,7 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var mainWindow: NSWindow?
     private let mainWindowDelegate = MainWindowDelegate()
     private var isConfigured = false
-    private var observer: NSObjectProtocol?
+    nonisolated(unsafe) private var observer: NSObjectProtocol?
 
     func configure(appState: AppState) {
         guard !isConfigured else { return }
@@ -46,28 +45,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.toggleQuickCapturePanel()
+            Task { @MainActor [weak self] in
+                self?.toggleQuickCapturePanel()
+            }
         }
     }
 
     func toggleQuickCapturePanel() {
-        if Thread.isMainThread {
-            quickCaptureController?.toggle()
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.quickCaptureController?.toggle()
-            }
-        }
+        quickCaptureController?.toggle()
     }
 
     func openQuickCapturePanel() {
-        if Thread.isMainThread {
-            quickCaptureController?.show()
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.quickCaptureController?.show()
-            }
-        }
+        quickCaptureController?.show()
     }
 
     @objc func openMainWindowFromStatusBar() {
@@ -110,6 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+@MainActor
 private final class MainWindowDelegate: NSObject, NSWindowDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
@@ -117,6 +107,7 @@ private final class MainWindowDelegate: NSObject, NSWindowDelegate {
     }
 }
 
+@MainActor
 private final class StatusBarController {
     private let statusItem: NSStatusItem
     private let onOpenMainWindow: () -> Void
@@ -224,27 +215,39 @@ enum QuickCaptureCloseReason {
     case submit
 }
 
+@MainActor
 final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
     private let appState: AppState
     private let linkResolver: BrowserLinkResolver
+    private let screenshotService: QuickCaptureScreenshotCapturing
+    private let screenCaptureAuthorizationService: ScreenCaptureAuthorizing
+    private let permissionGuidancePresenter: ScreenCapturePermissionGuiding
     private let toastPresenter: QuickCaptureToasting
     private let panel: QuickCapturePanelWindow
     private let inputView: QuickCaptureInputView
     private let inputCoordinator: QuickCaptureInputCoordinator
     private var stateMachine = QuickCapturePanelStateMachine()
     private var browserContextForSession: BrowserLinkContext?
+    private var foregroundProcessIDForSession: pid_t?
     private var cachedBrowserURLForSession: String?
-    private let screenshotThumbnailWidth: CGFloat = 72
-    private let screenshotCaptureDelay: TimeInterval = 0.12
+    private let screenshotCaptureDelay: TimeInterval
 
     init(
         appState: AppState,
         linkResolver: BrowserLinkResolver = BrowserLinkResolver(),
-        toastPresenter: QuickCaptureToasting? = nil
+        screenshotService: QuickCaptureScreenshotCapturing = QuickCaptureScreenshotService(),
+        screenCaptureAuthorizationService: ScreenCaptureAuthorizing = ScreenCaptureAuthorizationService(),
+        permissionGuidancePresenter: ScreenCapturePermissionGuiding = ScreenCapturePermissionAlertPresenter(),
+        toastPresenter: QuickCaptureToasting? = nil,
+        screenshotCaptureDelay: TimeInterval = 0.12
     ) {
         self.appState = appState
         self.linkResolver = linkResolver
+        self.screenshotService = screenshotService
+        self.screenCaptureAuthorizationService = screenCaptureAuthorizationService
+        self.permissionGuidancePresenter = permissionGuidancePresenter
         self.toastPresenter = toastPresenter ?? QuickCaptureToastController()
+        self.screenshotCaptureDelay = screenshotCaptureDelay
         inputView = QuickCaptureInputView(frame: .zero)
         panel = QuickCapturePanelWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 62),
@@ -299,6 +302,10 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         inputView.setLinkBrowserIcon(context?.icon)
     }
 
+    func debugSetForegroundProcessIDForTests(_ processID: pid_t?) {
+        foregroundProcessIDForSession = processID
+    }
+
     func toggle(animated: Bool = true) {
         switch stateMachine.state {
         case .hidden, .hiding:
@@ -309,14 +316,21 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
     }
 
     func show(animated: Bool = true) {
+        show(animated: animated, refreshSessionContext: true)
+    }
+
+    private func show(animated: Bool, refreshSessionContext: Bool) {
         guard stateMachine.requestShow() else { return }
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {
             stateMachine.markHidden()
             return
         }
-        browserContextForSession = activeSupportedBrowserContext()
-        cachedBrowserURLForSession = browserContextForSession.flatMap { linkResolver.resolveDirectURL(from: $0) }
-        inputView.setLinkBrowserIcon(browserContextForSession?.icon)
+        if refreshSessionContext {
+            foregroundProcessIDForSession = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            browserContextForSession = activeSupportedBrowserContext()
+            cachedBrowserURLForSession = browserContextForSession.flatMap { linkResolver.resolveDirectURL(from: $0) }
+            inputView.setLinkBrowserIcon(browserContextForSession?.icon)
+        }
         inputView.setLinkBrowserIconVisible(false)
 
         let frame = screen.visibleFrame
@@ -341,9 +355,11 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
                 panel.animator().alphaValue = 1
                 panel.animator().setFrame(targetFrame, display: false)
             } completionHandler: { [weak self] in
-                guard let self else { return }
-                self.stateMachine.markVisible()
-                self.inputCoordinator.focusWithRetry()
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.stateMachine.markVisible()
+                    self.inputCoordinator.focusWithRetry()
+                }
             }
         } else {
             panel.alphaValue = 1
@@ -352,7 +368,11 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    func hide(reason: QuickCaptureCloseReason, animated: Bool = true, completion: (() -> Void)? = nil) {
+    func hide(
+        reason: QuickCaptureCloseReason,
+        animated: Bool = true,
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
         _ = reason
         guard stateMachine.requestHide() else { return }
 
@@ -367,17 +387,21 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
                 context.timingFunction = CAMediaTimingFunction(controlPoints: 0.20, 0.80, 0.20, 1.00)
                 panel.animator().setFrame(recoilFrame, display: false)
             } completionHandler: { [weak self] in
-                guard let self else { return }
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0.20
-                    context.timingFunction = CAMediaTimingFunction(controlPoints: 0.40, 0.00, 0.60, 0.20)
-                    self.panel.animator().alphaValue = 0
-                    self.panel.animator().setFrame(finalFrame, display: false)
-                } completionHandler: {
-                    self.panel.orderOut(nil)
-                    self.panel.alphaValue = 1
-                    self.stateMachine.markHidden()
-                    completion?()
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    NSAnimationContext.runAnimationGroup { context in
+                        context.duration = 0.20
+                        context.timingFunction = CAMediaTimingFunction(controlPoints: 0.40, 0.00, 0.60, 0.20)
+                        self.panel.animator().alphaValue = 0
+                        self.panel.animator().setFrame(finalFrame, display: false)
+                    } completionHandler: {
+                        MainActor.assumeIsolated {
+                            self.panel.orderOut(nil)
+                            self.panel.alphaValue = 1
+                            self.stateMachine.markHidden()
+                            completion?()
+                        }
+                    }
                 }
             }
         } else {
@@ -412,9 +436,18 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         }
 
         if request.wantsScreenshot {
+            switch screenCaptureAuthorizationService.authorizeIfNeeded() {
+            case .granted:
+                break
+            case .denied, .requestDenied:
+                showScreenshotPermissionGuidance()
+                return
+            }
+
             inputView.playCaptureFeedbackAnimation { [weak self] in
                 self?.completeSubmission(
                     request: request,
+                    rawSubmission: text,
                     resolvedLinkURLString: linkURLString,
                     animatedHide: animatedHide
                 )
@@ -424,6 +457,7 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
 
         completeSubmission(
             request: request,
+            rawSubmission: text,
             resolvedLinkURLString: linkURLString,
             animatedHide: animatedHide
         )
@@ -439,27 +473,18 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
 
     private func completeSubmission(
         request: QuickCaptureSubmissionRequest,
+        rawSubmission: String,
         resolvedLinkURLString: String?,
         animatedHide: Bool
     ) {
-        let baseText: String
-        if let normalizedText = request.normalizedText {
-            baseText = normalizedText
-        } else if request.wantsScreenshot {
-            baseText = "Ekran Görüntüsü"
-        } else {
-            baseText = ""
-        }
+        let normalizedText = request.normalizedText
 
         guard request.wantsScreenshot else {
-            let content = buildRichContent(
-                text: baseText,
-                screenshotPNGData: nil,
+            appState.addQuickCaptureNote(
+                text: normalizedText,
                 linkURLString: resolvedLinkURLString,
-                screenshotFileURL: nil,
-                maxWidth: 560
+                screenshotPNGData: nil
             )
-            appState.addQuickNote(text: content.plainText, richContentData: content.richData)
             inputView.clearInput()
             hide(reason: .submit, animated: animatedHide)
             return
@@ -468,31 +493,38 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         hide(reason: .submit, animated: animatedHide) { [weak self] in
             guard let self else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + self.screenshotCaptureDelay) {
-                guard let capture = self.captureUsingSystemTool()
-                    ?? self.captureForegroundImage()
-                    ?? self.captureMainDisplayImage() else {
-                    self.appState.addQuickNote(text: baseText)
-                    self.inputView.clearInput()
-                    return
+                Task { [weak self] in
+                    guard let self else { return }
+
+                    do {
+                        let capture = try await self.screenshotService.capture(
+                            context: QuickCaptureCaptureContext(
+                                foregroundProcessID: self.foregroundProcessIDForSession
+                            )
+                        )
+
+                        await MainActor.run {
+                            self.appState.addQuickCaptureNote(
+                                text: normalizedText,
+                                linkURLString: resolvedLinkURLString,
+                                screenshotPNGData: capture.pngData
+                            )
+                            self.inputView.clearInput()
+                        }
+                    } catch let error as QuickCaptureScreenshotError {
+                        await MainActor.run {
+                            if error == .permissionDenied {
+                                self.showScreenshotPermissionGuidance()
+                            } else {
+                                self.restoreSubmissionAfterCaptureFailure(rawSubmission)
+                            }
+                        }
+                    } catch {
+                        await MainActor.run {
+                            self.restoreSubmissionAfterCaptureFailure(rawSubmission)
+                        }
+                    }
                 }
-
-                let fileURL = self.writeScreenshotToTemporaryFile(capture.pngData)
-                let thumbnailData = self.makeThumbnailData(from: capture.pngData, maxWidth: self.screenshotThumbnailWidth)
-                let content = self.buildRichContent(
-                    text: baseText,
-                    screenshotPNGData: thumbnailData,
-                    linkURLString: resolvedLinkURLString,
-                    screenshotFileURL: fileURL,
-                    maxWidth: self.screenshotThumbnailWidth
-                )
-                let attachments: [MediaAttachment] = fileURL.map { [MediaAttachment(id: UUID(), fileURL: $0, createdAt: .now)] } ?? []
-
-                self.appState.addQuickNote(
-                    text: content.plainText,
-                    richContentData: content.richData,
-                    mediaAttachments: attachments
-                )
-                self.inputView.clearInput()
             }
         }
     }
@@ -511,177 +543,16 @@ final class QuickCaptureWindowController: NSObject, NSWindowDelegate {
         inputCoordinator.focusWithRetry()
     }
 
-    private func captureUsingSystemTool() -> ScreenshotCapture? {
-        let dirURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("NoteLightShots", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-
-        let fileURL = dirURL.appendingPathComponent("tmp-capture-\(UUID().uuidString).png")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        process.arguments = ["-x", "-t", "png", fileURL.path]
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return nil }
-            let data = try Data(contentsOf: fileURL)
-            guard let image = NSImage(data: data) else { return nil }
-            return ScreenshotCapture(image: image, pngData: data)
-        } catch {
-            return nil
-        }
+    private func showScreenshotPermissionGuidance() {
+        permissionGuidancePresenter.presentPermissionRequiredAlert(anchoredTo: panel)
+        inputCoordinator.focusWithRetry()
     }
 
-    private struct ScreenshotCapture {
-        let image: NSImage
-        let pngData: Data
-    }
-
-    private func captureMainDisplayImage() -> ScreenshotCapture? {
-        guard let cgImage = CGDisplayCreateImage(CGMainDisplayID()) else { return nil }
-        return makeCapture(from: cgImage)
-    }
-
-    private func captureForegroundImage() -> ScreenshotCapture? {
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return nil }
-        guard let windowInfoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            return nil
-        }
-
-        for info in windowInfoList {
-            guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
-                  ownerPID == frontApp.processIdentifier,
-                  let windowNumber = info[kCGWindowNumber as String] as? UInt32 else {
-                continue
-            }
-
-            let layer = (info[kCGWindowLayer as String] as? Int) ?? 0
-            if layer != 0 { continue }
-
-            guard let cgImage = CGWindowListCreateImage(
-                .null,
-                [.optionIncludingWindow],
-                CGWindowID(windowNumber),
-                [.boundsIgnoreFraming, .bestResolution]
-            ) else {
-                continue
-            }
-
-            return makeCapture(from: cgImage)
-        }
-
-        return nil
-    }
-
-    private func makeCapture(from cgImage: CGImage) -> ScreenshotCapture? {
-        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        let imageRep = NSBitmapImageRep(cgImage: cgImage)
-        guard let pngData = imageRep.representation(using: .png, properties: [:]) else { return nil }
-        return ScreenshotCapture(image: nsImage, pngData: pngData)
-    }
-
-    private func makeThumbnailData(from pngData: Data, maxWidth: CGFloat) -> Data {
-        guard maxWidth > 0, let image = NSImage(data: pngData) else { return pngData }
-        let originalSize = image.size
-        guard originalSize.width > maxWidth, originalSize.width > 0 else { return pngData }
-
-        let scale = maxWidth / originalSize.width
-        let targetSize = NSSize(width: maxWidth, height: max(1, originalSize.height * scale))
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: Int(targetSize.width.rounded()),
-            pixelsHigh: Int(targetSize.height.rounded()),
-            bitsPerSample: 8,
-            samplesPerPixel: 4,
-            hasAlpha: true,
-            isPlanar: false,
-            colorSpaceName: .deviceRGB,
-            bytesPerRow: 0,
-            bitsPerPixel: 0
-        ) else { return pngData }
-
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        image.draw(
-            in: NSRect(origin: .zero, size: targetSize),
-            from: NSRect(origin: .zero, size: originalSize),
-            operation: .copy,
-            fraction: 1
-        )
-        NSGraphicsContext.restoreGraphicsState()
-        return rep.representation(using: .png, properties: [:]) ?? pngData
-    }
-
-    private func writeScreenshotToTemporaryFile(_ pngData: Data) -> URL? {
-        let dirURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("NoteLightShots", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-
-        let fileName = "shot-\(Int(Date().timeIntervalSince1970)).png"
-        let fileURL = dirURL.appendingPathComponent(fileName)
-        do {
-            try pngData.write(to: fileURL, options: .atomic)
-            return fileURL
-        } catch {
-            return nil
-        }
-    }
-
-    private func buildRichContent(
-        text: String,
-        screenshotPNGData: Data?,
-        linkURLString: String?,
-        screenshotFileURL: URL?,
-        maxWidth: CGFloat
-    ) -> (plainText: String, richData: Data?) {
-        let defaultAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 16, weight: .regular),
-            .foregroundColor: NSColor.labelColor
-        ]
-        let rich = NSMutableAttributedString(string: text, attributes: defaultAttributes)
-        var plainText = text
-
-        if let linkURLString, let linkURL = URL(string: linkURLString) {
-            let prefix = rich.length > 0 ? "\n" : ""
-            let linkLine = "\(prefix)link: \(linkURLString)"
-            let linkAttributed = NSMutableAttributedString(string: linkLine, attributes: defaultAttributes)
-            let range = (linkLine as NSString).range(of: linkURLString)
-            if range.location != NSNotFound {
-                linkAttributed.addAttribute(.link, value: linkURL, range: range)
-                linkAttributed.addAttribute(.foregroundColor, value: NSColor.systemBlue, range: range)
-                linkAttributed.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: range)
-            }
-            rich.append(linkAttributed)
-            plainText += "\(plainText.isEmpty ? "" : "\n")link: \(linkURLString)"
-        }
-
-        if let screenshotPNGData {
-            let spacer = rich.length > 0 ? "\n\n" : ""
-            rich.append(NSAttributedString(string: spacer, attributes: defaultAttributes))
-            let attachment = NSTextAttachment(data: screenshotPNGData, ofType: UTType.png.identifier)
-            if let image = NSImage(data: screenshotPNGData), image.size.width > 0 {
-                let scaledWidth = min(image.size.width, maxWidth)
-                let scale = scaledWidth / image.size.width
-                attachment.bounds = NSRect(x: 0, y: 0, width: scaledWidth, height: image.size.height * scale)
-            }
-            rich.append(NSAttributedString(attachment: attachment))
-        }
-
-        if let screenshotFileURL {
-            let linkLine = "\n\n📷 Ekran goruntusu"
-            let linkAttributed = NSMutableAttributedString(string: linkLine, attributes: defaultAttributes)
-            let range = (linkLine as NSString).range(of: "📷 Ekran goruntusu")
-            if range.location != NSNotFound {
-                linkAttributed.addAttribute(.link, value: screenshotFileURL, range: range)
-                linkAttributed.addAttribute(.foregroundColor, value: NSColor.systemBlue, range: range)
-                linkAttributed.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: range)
-            }
-            rich.append(linkAttributed)
-            plainText += "\(plainText.isEmpty ? "" : "\n\n")ekran-goruntusu: \(screenshotFileURL.lastPathComponent)"
-        }
-
-        return (plainText: plainText, richData: rich.rtfdData())
+    private func restoreSubmissionAfterCaptureFailure(_ rawSubmission: String) {
+        show(animated: false, refreshSessionContext: false)
+        inputView.setInputText(rawSubmission)
+        toastPresenter.show(message: "Ekran goruntusu alinamadi", anchoredTo: panel)
+        inputCoordinator.focusWithRetry()
     }
 
     private func activeSupportedBrowserContext() -> BrowserLinkContext? {
@@ -702,6 +573,7 @@ private func scaledFrame(_ frame: NSRect, scale: CGFloat) -> NSRect {
     return NSRect(x: newX, y: newY, width: newWidth, height: newHeight)
 }
 
+@MainActor
 private final class QuickCapturePanelWindow: NSPanel {
     var onEscape: (() -> Void)?
 
@@ -729,6 +601,7 @@ private final class QuickCapturePanelWindow: NSPanel {
     }
 }
 
+@MainActor
 final class QuickCaptureInputCoordinator {
     private weak var window: NSWindow?
     private weak var textField: NSTextField?
@@ -767,12 +640,13 @@ final class QuickCaptureInputCoordinator {
         pendingWorkItems.removeAll()
     }
 
-    static func normalizeSubmission(_ text: String) -> String? {
+    nonisolated static func normalizeSubmission(_ text: String) -> String? {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
     }
 }
 
+@MainActor
 private final class QuickCaptureTextField: NSTextField {
     var onEscape: (() -> Void)?
 
@@ -789,6 +663,7 @@ private final class QuickCaptureTextField: NSTextField {
     }
 }
 
+@MainActor
 private final class QuickCaptureInputView: NSView, NSTextFieldDelegate {
     let textField = QuickCaptureTextField(frame: .zero)
 
@@ -844,31 +719,45 @@ private final class QuickCaptureInputView: NSView, NSTextFieldDelegate {
         linkBrowserIconView.isHidden = !visible || linkBrowserIconView.image == nil
     }
 
-    func playCaptureFeedbackAnimation(completion: @escaping () -> Void) {
+    func playCaptureFeedbackAnimation(completion: @escaping @MainActor @Sendable () -> Void) {
         guard let layer else {
             completion()
             return
         }
 
-        let originalBorder = layer.borderColor
-        let originalBackground = layer.backgroundColor
-        let originalWidth = layer.borderWidth
+        struct CaptureFeedbackSnapshot: @unchecked Sendable {
+            let layer: CALayer
+            let originalBorder: CGColor?
+            let originalBackground: CGColor?
+            let originalWidth: CGFloat
+        }
+
+        let snapshot = CaptureFeedbackSnapshot(
+            layer: layer,
+            originalBorder: layer.borderColor,
+            originalBackground: layer.backgroundColor,
+            originalWidth: layer.borderWidth
+        )
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.10
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.24, 0.00, 0.30, 1.00)
             layer.borderColor = NSColor.white.withAlphaComponent(0.70).cgColor
             layer.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
-            layer.borderWidth = originalWidth + 0.8
-        } completionHandler: {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.16
-                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.80, 0.24, 1.00)
-                layer.borderColor = originalBorder
-                layer.backgroundColor = originalBackground
-                layer.borderWidth = originalWidth
-            } completionHandler: {
-                completion()
+            layer.borderWidth = snapshot.originalWidth + 0.8
+        } completionHandler: { [snapshot] in
+            MainActor.assumeIsolated {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.16
+                    context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.80, 0.24, 1.00)
+                    snapshot.layer.borderColor = snapshot.originalBorder
+                    snapshot.layer.backgroundColor = snapshot.originalBackground
+                    snapshot.layer.borderWidth = snapshot.originalWidth
+                } completionHandler: {
+                    MainActor.assumeIsolated {
+                        completion()
+                    }
+                }
             }
         }
     }
@@ -884,8 +773,9 @@ private final class QuickCaptureInputView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func submitAction() {
-        guard let normalized = QuickCaptureInputCoordinator.normalizeSubmission(textField.stringValue) else { return }
-        onSubmit?(normalized)
+        let rawValue = textField.stringValue
+        guard QuickCaptureInputCoordinator.normalizeSubmission(rawValue) != nil else { return }
+        onSubmit?(rawValue)
     }
 
     private func focusInput() {
@@ -989,9 +879,10 @@ struct QuickCaptureHotkeyPolicy {
     }
 }
 
+@MainActor
 final class QuickCaptureHotkeyService {
-    private var hotKeyRef: EventHotKeyRef?
-    private var eventHandlerRef: EventHandlerRef?
+    nonisolated(unsafe) private var hotKeyRef: EventHotKeyRef?
+    nonisolated(unsafe) private var eventHandlerRef: EventHandlerRef?
     private let onHotKey: () -> Void
 
     init(onHotKey: @escaping () -> Void) {
@@ -1042,8 +933,8 @@ final class QuickCaptureHotkeyService {
             GetApplicationEventTarget(),
             { _, _, userData in
                 guard let userData else { return noErr }
-                let service = Unmanaged<QuickCaptureHotkeyService>.fromOpaque(userData).takeUnretainedValue()
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    let service = Unmanaged<QuickCaptureHotkeyService>.fromOpaque(userData).takeUnretainedValue()
                     service.onHotKey()
                 }
                 return noErr

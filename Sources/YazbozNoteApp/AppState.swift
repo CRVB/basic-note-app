@@ -1,49 +1,26 @@
 import Foundation
 import Combine
-import AppKit
 
-struct MediaAttachment: Identifiable, Hashable {
-    let id: UUID
-    var fileURL: URL
-    var createdAt: Date
-}
-
-struct NoteItem: Identifiable, Hashable {
-    let id: UUID
-    var title: String
-    var content: String
-    var richContentData: Data?
-    var mediaAttachments: [MediaAttachment]
-    var createdAt: Date
-    var updatedAt: Date
-
-    var preview: String {
-        content.replacingOccurrences(of: "\n", with: " ")
-    }
-}
-
+@MainActor
 final class AppState: ObservableObject {
-    @Published var notes: [NoteItem] = [
-        NoteItem(
-            id: UUID(),
-            title: "NoteLight'e hoş geldin",
-            content: "Hızlı paneli açmak için Cmd+ç kullan.",
-            richContentData: nil,
-            mediaAttachments: [],
-            createdAt: .now,
-            updatedAt: .now
-        ),
-        NoteItem(
-            id: UUID(),
-            title: "Örnek not",
-            content: "Bu uygulamayı sadeleştirilmiş bir akışla kullanıyoruz.",
-            richContentData: nil,
-            mediaAttachments: [],
-            createdAt: .now.addingTimeInterval(-3600),
-            updatedAt: .now.addingTimeInterval(-3600)
-        )
-    ]
+    @Published var notes: [NoteItem]
     @Published var selectedNoteID: UUID?
+
+    let noteStore: NoteStore
+
+    init(noteStore: NoteStore = NoteStore()) {
+        self.noteStore = noteStore
+
+        let loadedNotes: [NoteItem]
+        do {
+            loadedNotes = try noteStore.loadNotes()
+        } catch {
+            loadedNotes = []
+        }
+
+        notes = loadedNotes
+        selectedNoteID = loadedNotes.first?.id
+    }
 
     var selectedNote: NoteItem? {
         guard let selectedNoteID else { return nil }
@@ -56,43 +33,87 @@ final class AppState: ObservableObject {
         }
     }
 
-    func addQuickNote(text: String, richContentData: Data? = nil, mediaAttachments: [MediaAttachment] = []) {
-        let title = text.split(separator: "\n").first.map(String.init) ?? "Yeni Not"
-        let item = NoteItem(
-            id: UUID(),
-            title: title,
-            content: text,
-            richContentData: richContentData,
-            mediaAttachments: mediaAttachments,
-            createdAt: .now,
-            updatedAt: .now
-        )
-        notes.insert(item, at: 0)
-        selectedNoteID = item.id
-    }
-
     func createNewNote() {
         let item = NoteItem(
             id: UUID(),
             title: "Yeni Not",
-            content: "",
-            richContentData: nil,
+            blocks: [.paragraph()],
+            imageAssets: [],
             mediaAttachments: [],
             createdAt: .now,
             updatedAt: .now
         )
         notes.insert(item, at: 0)
         selectedNoteID = item.id
+        persistCurrentNotes()
     }
 
-    func updateSelectedNote(title: String, attributedContent: NSAttributedString, mediaAttachments: [MediaAttachment]) {
+    func updateSelectedNote(title: String, blocks: [NoteBlock], imageAssets: [ImageAsset]) {
         guard let selectedNoteID else { return }
         guard let index = notes.firstIndex(where: { $0.id == selectedNoteID }) else { return }
-        notes[index].title = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Başlıksız Not" : title
-        notes[index].content = attributedContent.string
-        notes[index].richContentData = attributedContent.rtfdData()
-        notes[index].mediaAttachments = mediaAttachments
+
+        let normalizedBlocks = NoteBlockEditing.normalizedBlocks(blocks)
+        let referencedAssetIDs = Set(normalizedBlocks.compactMap(\.imageAssetID))
+        let filteredAssets = imageAssets.filter { referencedAssetIDs.contains($0.id) }
+
+        notes[index].title = normalizedTitle(from: title, blocks: normalizedBlocks)
+        notes[index].blocks = normalizedBlocks
+        notes[index].imageAssets = filteredAssets
+        notes[index].mediaAttachments = filteredAssets.map(noteStore.mediaStore.makeMediaAttachment(for:))
         notes[index].updatedAt = .now
+        persistCurrentNotes()
+    }
+
+    func addQuickCaptureNote(
+        text: String?,
+        linkURLString: String?,
+        screenshotPNGData: Data?
+    ) {
+        do {
+            var blocks: [NoteBlock] = []
+            var imageAssets: [ImageAsset] = []
+
+            if let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                blocks.append(.paragraph(text))
+            }
+
+            if let linkURLString, !linkURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                blocks.append(.paragraph("link: \(linkURLString)"))
+            }
+
+            if let screenshotPNGData {
+                let asset = try noteStore.storeScreenshot(pngData: screenshotPNGData)
+                imageAssets.append(asset)
+                blocks.append(.image(assetID: asset.id, preferredWidth: min(760, asset.pixelWidth)))
+            }
+
+            let normalizedBlocks = NoteBlockEditing.normalizedBlocks(blocks)
+            let title = normalizedTitle(
+                from: text ?? "",
+                blocks: normalizedBlocks,
+                fallback: screenshotPNGData == nil ? "Yeni Not" : "Ekran Goruntusu"
+            )
+
+            let note = NoteItem(
+                id: UUID(),
+                title: title,
+                blocks: normalizedBlocks,
+                imageAssets: imageAssets,
+                mediaAttachments: imageAssets.map(noteStore.mediaStore.makeMediaAttachment(for:)),
+                createdAt: .now,
+                updatedAt: .now
+            )
+
+            notes.insert(note, at: 0)
+            selectedNoteID = note.id
+            persistCurrentNotes()
+        } catch {
+            return
+        }
+    }
+
+    func importImage(from fileURL: URL) throws -> ImageAsset {
+        try noteStore.importImage(from: fileURL)
     }
 
     func deleteSelectedNote() {
@@ -100,31 +121,36 @@ final class AppState: ObservableObject {
         guard let index = notes.firstIndex(where: { $0.id == selectedNoteID }) else { return }
         notes.remove(at: index)
         self.selectedNoteID = notes.first?.id
-    }
-}
-
-extension NSAttributedString {
-    func rtfdData() -> Data? {
-        let fullRange = NSRange(location: 0, length: length)
-        return try? data(
-            from: fullRange,
-            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]
-        )
+        persistCurrentNotes()
     }
 
-    static func fromStoredContent(data: Data?, plainText: String) -> NSAttributedString {
-        if let data,
-           let attributed = try? NSAttributedString(
-               data: data,
-               options: [.documentType: NSAttributedString.DocumentType.rtfd],
-               documentAttributes: nil
-           ) {
-            return attributed
+    private func persistCurrentNotes() {
+        do {
+            try noteStore.saveNotes(notes)
+        } catch {
+            return
         }
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 16, weight: .regular),
-            .foregroundColor: NSColor.textColor
-        ]
-        return NSAttributedString(string: plainText, attributes: attrs)
+    }
+
+    private func normalizedTitle(
+        from title: String,
+        blocks: [NoteBlock],
+        fallback: String = "Basliksiz Not"
+    ) -> String {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedTitle.isEmpty {
+            return trimmedTitle
+        }
+
+        if let firstLine = blocks.plainText
+            .split(separator: "\n")
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !firstLine.isEmpty {
+            return firstLine
+        }
+
+        return fallback
     }
 }

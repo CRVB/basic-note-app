@@ -244,12 +244,14 @@ class BrowserLinkResolver {
 
 /// Kullanıcıya bildirim mesajı göstermek için protokol
 /// "Not eklendi", "Link kopyalandı" gibi toast (kısa çıkıcı) mesajlar gösterir
+@MainActor
 protocol QuickCaptureToasting: AnyObject {
     func show(message: String, anchoredTo window: NSWindow)
 }
 
 /// Toast (kısa bildirim) mesajlarını ekranda göstermek için controller sınıfı
 /// Başlık penceresinin üstünde görünen kısa çıkıcı mesajları yönetir
+@MainActor
 final class QuickCaptureToastController: QuickCaptureToasting {
     private let panel: QuickCaptureToastWindow
     private let contentView = QuickCaptureToastView(frame: .zero)
@@ -322,7 +324,9 @@ final class QuickCaptureToastController: QuickCaptureToasting {
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.40, 0.00, 0.60, 0.20)
             panel.animator().alphaValue = 0
         } completionHandler: { [weak self] in
-            self?.panel.orderOut(nil)
+            MainActor.assumeIsolated {
+                self?.panel.orderOut(nil)
+            }
         }
     }
 
@@ -344,11 +348,13 @@ final class QuickCaptureToastController: QuickCaptureToasting {
     }
 }
 
+@MainActor
 private final class QuickCaptureToastWindow: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }
 
+@MainActor
 private final class QuickCaptureToastView: NSView {
     private let label = NSTextField(labelWithString: "")
 
