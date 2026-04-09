@@ -1,10 +1,6 @@
 # Yazboz Note
 
-<<<<<<< HEAD
 Yazboz Note, macOS için geliştirilmiş hızlı ve sade bir not alma uygulamasıdır. SwiftUI + AppKit üzerine inşa edilmiştir.
-=======
-## Hızlı test akışı
->>>>>>> 690e3d5 (son sürüm kontrolü)
 
 ---
 
@@ -40,7 +36,6 @@ make build
 make run
 ```
 
-<<<<<<< HEAD
 **Derleme çıktısını temizleyin:**
 
 ```bash
@@ -76,16 +71,3 @@ Sources/YazbozNoteApp/
 ## Yol Haritası
 
 Uygulamanın planlanan geliştirme aşamaları için [roadmap.md](roadmap.md) dosyasına bakın.
-=======
-Test sırasında:
-- Hızlı paneli `Cmd+Ç` ile aç/kapat
-- Veya toolbar `Hızlı Yakala` butonu ile aç
-- Veya status bar menüsünden `Hızlı Not` seç
-- Metin yazıp `Enter` ile kaydet
-- Paneli `Esc` ile kapat
-- Dış tıklama ile kapanmaz
-
-Durdurma:
-- Uygulamada `Cmd+Q`
-- Ya da terminalde `Ctrl+C`
->>>>>>> 690e3d5 (son sürüm kontrolü)
