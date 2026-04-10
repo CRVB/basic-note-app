@@ -16,9 +16,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "YazbozNoteApp",
-            resources: [
-                .copy("Resources")
-            ]
+            exclude: ["Resources"]
         ),
         .testTarget(
             name: "YazbozNoteAppTests",

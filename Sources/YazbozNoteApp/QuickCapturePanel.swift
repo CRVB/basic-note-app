@@ -86,7 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func loadBrandIcon() -> NSImage? {
-        guard let url = Bundle.module.url(forResource: "AppIcon", withExtension: "icns") else {
+        guard let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns") else {
             return nil
         }
         return NSImage(contentsOf: url)
